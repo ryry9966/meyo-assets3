@@ -1,59 +1,69 @@
 ---
 title: OpenClaw 的 session 隔离：子 Agent 怎么不污染主会话
-feedId: 43501
+feedId: 43520
 source: 综合讨论
 publishedAt: 2026-11-05
 ---
 
 ## 背景
 
-用 OpenClaw 跑长任务的朋友大概率遇到过：主会话越用越钝。早期它还能精准调用工具、回答简洁，几轮复杂任务之后开始复述无关细节、丢约束。原因多半不在模型，而是主会话上下文被过程性内容塞满了——工具原始输出、失败的尝试、大段抓取的网页和日志。
+OpenClaw 的典型用法是主会话做调度和决策，把重活拆给子 Agent：读大文件、跑检索、批量执行工具调用。子 Agent 理论上有自己的上下文，听起来很干净，但实际跑长任务的主会话还是会被撑大、被带偏。问题不在于子 Agent 本身，而在于**回流的东西没管住**。
 
-子 agent 本来是解药：把重活外包出去。但如果隔离没做对，它只是把污染换了个地方。
+## 问题：三类典型污染
 
-## 问题出在哪
+1. **全量 transcript 回流**。子 Agent 跑完，把工具调用明细、读进来的大段文件内容一并塞回主会话，主上下文瞬间膨胀。
+2. **session 串扰**。子 Agent 默认继承了主会话的 session id 或共享 memory，主会话的历史对它可见，它返回的内容也夹带着不该有的上下文假设。表现为"子 Agent 知道不该知道的事"。
+3. **文件系统串扰**。子 Agent 把中间产物写进共享工作区，主会话后来读到某份草稿，把它当成了最终结论。
 
-两类典型的污染路径：
+## 做法：四步隔离
 
-1. **共享上下文**。子任务直接在主会话里展开，或者 spawn 时把主会话历史整段带过去，几 KB 的工具返回、搜索结果全部落进同一个上下文。
-2. **共享写入面**。子 agent 把中间产物写进共享记忆库或同一个 workspace，主会话下次召回时被噪声淹没，文件还会互相覆盖。
+**第一步，session 生命周期显式化。** spawn 子 Agent 时指定任务级 session，结束即销毁，不继承历史：
 
-## 我的做法
+```yaml
+# .openclaw/subagent.yaml
+session:
+  scope: task            # 每个任务独立 session，结束销毁
+  inherit_history: false
+report:
+  format: json           # 只回流结构化结果
+  max_tokens: 800
+workspace:
+  scratch: runs/{task_id}/
+memory:
+  write: task            # 禁止写全局 memory
+tools:
+  deny: [session.append, config.write, memory.write_global]
+```
 
-以我当前版本的行为为准（不同版本 spawn 参数有差异，键名请对照文档）：
+**第二步，约束回流。** 只允许子 Agent 返回一份结构化摘要（结论 + 关键证据 + 产物路径），不回传工具明细和中间推理。给 `max_tokens` 设上限，否则摘要本身就是二次污染。
 
-1. **独立 session 派发**。用内置的会话派发工具（`sessions_spawn` 一类）为子任务开独立 session key，子 agent 有自己的 transcript，工具输出留在子会话内，不进主上下文。
-2. **只给任务契约，不给历史**。spawn prompt 写三件事：目标、可用输入、输出格式。不贴主会话的对话记录，需要背景就提炼成两三句。
-3. **约定压缩返回**。明确要求子 agent 只返回结构化摘要（限定字数，或一段 JSON：结论 / 证据路径 / 未解决问题）。主会话收到的只有这个。
-4. **写入面按命名空间隔离**。子 agent 的文件输出统一放到 `workspace/{session_id}/` 下，结束后由主会话决定搬运哪些结论文件，而不是默认全量回流。
-5. **收尾归档**。子会话用完及时过期或清理，定期看一眼会话列表，别让废弃 session 堆积。
+**第三步，工作区命名空间化。** 中间产物统一写到 `runs/{task_id}/`，主会话只读最终 artifact。并发跑多个子 Agent 时，各自目录天然不冲突。
+
+**第四步，工具白名单收敛。** 用 `deny` 掐掉会改主会话状态的工具（`session.append`、`config.write`），子 Agent 只保留完成任务所需的最小集合。
 
 ## 踩坑点
 
-- **spawn prompt 里"顺手"贴大段背景**。隔离了会话却没隔离输入，等于白做。
-- **子 agent 直写主记忆库**。没有命名空间限制时，召回阶段照样被污染，而且更隐蔽。
-- **返回完整过程而不是结论**。污染只是从"过程"变成了"过程报告"。
-- **并行子 agent 写同一个文件**。加锁，或者干脆每人一个目录。
-- **升级后行为漂移**。各版本默认隔离行为不完全一致，升级后拿一个已知的污染场景做回归验证。
+- **忘设 `inherit_history: false`**，默认继承导致串扰，症状隐蔽，建议写进团队模板。
+- **摘要不设上限**。见过子 Agent 返回 8k 字"摘要"，等于换了个方向污染。
+- **子 Agent 返回里带临时绝对路径**，主会话后续引用时路径已失效。约定统一用 `runs/{task_id}/` 相对路径。
+- **异常退出没清 session**，残留上下文被下一个任务复用。定期扫一遍 sessions 目录，清孤儿。
+- **多个子 Agent 共用一个 scratch 目录**，互相覆盖文件，最后谁对都说不清。
 
-## 可复用的建议
+## 可复用建议
 
-- 把"子 agent 输出模板"固化成一段可复用的 prompt 片段，团队内统一，比每次现写省心。
-- 给子任务设 token 预算并写进任务描述，超了让它先收敛再返回。
-- 结论一律落盘、主会话只引用路径，需要细节再按需打开文件。
-- 每周清一次会话列表和孤儿目录，成本很低，收益明显。
+把"子 Agent = 无状态函数"作为默认心智模型：输入是 prompt 和只读资料，输出是校验过的结构化结果，其余一切销毁。主会话只做调度与裁决，不做中间计算。在团队里固化一份 subagent profile（session 策略、工具白名单、回流 schema），新任务直接套模板，比每次临时拍脑袋省心得多。
 
 ## 总结
 
-Session 隔离的本质不是"多开几个会话"，而是给子 agent 立上下文契约：**输入最小化、过程留原地、返回必压缩、写入有命名空间**。子 agent 是工具，不是同事——别让它把工位搬到你的主会话里。做到这四条，长任务跑几十轮，主会话依然干净。
+session 隔离的本质是控制信息流向：中间态不回流、共享资源命名空间化、生命周期显式化。管住这三件事，主会话才能在长任务里保持清醒。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-05/2db610385b0cc11f.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-05/b75a2a73a81f96c3.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-05/1c2ddaae9f152dc3.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-05/02edad3d2e01c97c.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-05/d5dfb80549f1c8e2.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-05/7f77d1c645aafcad.png)
 
