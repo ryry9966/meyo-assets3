@@ -1,77 +1,83 @@
 ---
 title: OpenClaw 的 cron vs heartbeat：两种定时任务怎么选
-feedId: 43570
+feedId: 43602
 source: 综合讨论
 publishedAt: 2026-11-06
 ---
 
-## 背景
+# 背景
 
-OpenClaw 里有两种原生的"让 Agent 定时干活"的机制：**heartbeat**（周期性唤醒，读工作区的 HEARTBEAT.md 清单）和 **cron**（crontab 风格的定时任务）。表面上都是"隔段时间触发一次模型"，但设计意图和成本模型完全不同。我见过不少用反的案例，结果要么是 token 白烧，要么是关键任务错过时间点。
+Agent 常驻跑起来之后，第一类真实需求几乎都是“定时做点事”：早上推日报、定期巡检磁盘、每周汇总依赖更新。OpenClaw 给了两条路：**cron job** 和 **heartbeat**。两者都能触发 agent，但设计意图完全不同。我们团队早期混用，要么 token 白烧，要么任务不准点，这里把选择依据整理一下。
 
-## 问题
+# 两者分别是什么
 
-真实需求通常分两类：
+**Cron job**：独立调度器。用 `openclaw cron add` 注册，标准 cron 表达式触发一次完整的 agent 会话。时间到 → 执行你给的 prompt → 按配置投递结果到频道，或静默落盘。
 
-- "每天早上 9 点，把昨天部署摘要推给我" —— 时间点固定，结果必须送达；
-- "盯一下磁盘、CI 和收件箱有没有异常，有事再叫我" —— 时间不固定，按需触发，无事保持安静。
+**Heartbeat**：agent 自身的心跳节拍。每隔 N 分钟（默认 30 分钟）醒来一次，读 workspace 里的 `HEARTBEAT.md`，有事就处理，没事回一个极简确认继续睡。
 
-两种机制各管一头，混着用就会出问题。
+一句话区分：**cron 是“到点必须干的活”，heartbeat 是“醒来顺手看一眼的待办”**。
 
-## 机制差异
+# 怎么选：三条判断标准
 
-| 维度 | heartbeat | cron |
-|---|---|---|
-| 触发方式 | 固定间隔（默认 30m） | cron 表达式 / 间隔 / 一次性 at |
-| 谁决定做什么 | Agent 每次醒来按清单自行判断 | 计划和提示词在配置里写死 |
-| 会话 | 主会话，带对话上下文 | 可选 isolated，独立上下文 |
-| 输出 | 默认静默（HEARTBEAT_OK 即不出声） | 可选 `--announce` 推送到频道 |
-| 持久化 | 配置 + 清单文件 | 任务列表持久化，重启不丢 |
+1. **触发条件是“时间点”还是“状态”？** 每天早八点发摘要 → cron。“有空检查下磁盘是否快满、依赖是否有更新” → heartbeat。前者关心时刻，后者关心条件成立。
+2. **动作是否固定？** prompt 每次一样、输出格式可预期 → cron。动作需按当时情况自由发挥（多项待办、自我维护）→ heartbeat。
+3. **频率多高？** 心跳是全局节拍，调到几分钟一次，每次唤醒都烧 token。真需要分钟级轮询外部状态，用 cron 或事件回调，别拿 heartbeat 硬扛。
 
-一句话规则：**有明确钟点、动作固定的走 cron；没有固定时间、需要判断、默认沉默的走 heartbeat。**
+# 做法与配置
 
-## 做法
+Cron 典型注册：
 
-heartbeat 三步：
+```bash
+openclaw cron add \
+  --name "daily-digest" \
+  --cron "0 8 * * *" \
+  --message "汇总昨日会话要点，输出不超过 10 行" \
+  --deliver --channel telegram
+```
 
-1. 配置里设 `agents.defaults.heartbeat.every: "30m"`；
-2. HEARTBEAT.md 只写短条件，例如"磁盘占用 > 85% 时汇报一次，否则保持安静"；
-3. 确保默认分支是沉默，避免无事唤醒、有事刷屏。
+一次性任务用 `--schedule-at`；用 `openclaw cron list` 和 `openclaw cron runs <id>` 回看历史执行与失败原因。
 
-cron 三步：
+Heartbeat：把周期性待办写进 workspace 的 `HEARTBEAT.md`，一项一行，写清“何时做、做到什么程度算完成”：
 
-1. `openclaw cron add --name daily-digest --cron "0 9 * * *" --session isolated --announce --message "总结昨日部署与失败项"`（参数名随版本略有出入，以 `openclaw cron --help` 为准）；
-2. 先用 `openclaw cron run <id>` 手动干跑一次，确认输出格式和投递路径；
-3. `openclaw cron list` 核对计划与下次触发时间。
+```markdown
+- 每次心跳检查 /data 磁盘占用，超过 85% 才通知我
+- 周一上午检查依赖更新，只汇总，不升级
+```
 
-## 踩坑点
+间隔在配置里调：
 
-1. **heartbeat 间隔压到 1–5 分钟**：每次唤醒都是真实模型调用，回复 HEARTBEAT_OK 也计费。30 分钟是合理起点，不需要模型判断的事不该走 heartbeat。
-2. **清单写成待办列表**：Agent 每次醒来都执行一遍，疯狂刷消息。清单应该是"条件 → 动作"，不是"要做的事"。
-3. **cron 死守主会话**：任务提示词混进主对话上下文，污染记忆，也被主对话干扰。一次性任务一律 isolated。
-4. **cron 忘了 announce**：任务跑了，结果没有任何去处，你以为它没执行。需要人看的结果务必配投递。
-5. **时区与错过触发**：表达式按网关主机时区解析；网关重启后的错过任务，用 miss 策略决定跳过还是补跑。
-6. **把 heartbeat 当实时**：它是轮询不是事件。"一发生就触发"请走频道 webhook / 事件类插件，缩短间隔救不了延迟。
+```json
+{ "agents": { "defaults": { "heartbeat": { "every": "45m" } } } }
+```
 
-## 可复用建议
+新版本中 `HEARTBEAT.md` 为空会直接跳过唤醒，接近零成本；老版本建议任务做完手动清空文件。
 
-- 默认配置：heartbeat 30m + 短条件清单；凡有明确钟点的任务进 cron；
-- 一条 cron 任务只做一件事，isolated + announce 是标准搭配；
-- 新 cron 任务先手动干跑再放行；
-- 每周看一次 token 用量，heartbeat 占大头就拉长间隔，或把不需要判断的任务挪走；
-- HEARTBEAT.md 是决策文件，不是待办堆放处，越短越好。
+# 踩坑点
 
-## 总结
+- **时区**：cron 按进程系统时区解析，Docker 里默认常是 UTC，“早八点”实际跑在下午四点。容器里显式设置 `TZ`。
+- **cron 静默失败**：不配 `--deliver` 时结果只落在本地，挂了也没人知道。重要任务务必配投递，或在 prompt 里要求失败时主动说明。
+- **heartbeat 空转**：老版本无论有没有待办都完整唤醒一次。发现用量异常上涨，先查这里。
+- **任务重叠**：心跳任务跑得比间隔还长时会叠加触发。长任务挪去 cron，heartbeat 只留轻量检查。
+- **prompt 里写死时间**：cron 的 message 里写“今天”没问题，但 agent 不一定知道确切日期，让它在执行时自己取当前时间。
 
-两者的本质区别是"谁决定何时行动"：cron 是你决定（时刻表写在配置里），heartbeat 是 Agent 决定（醒来后按清单判断）。稳定组合是 cron 管钟点驱动，heartbeat 管状态驱动，别让一方替另一方干活。当你发现 heartbeat 清单里堆了一堆固定时刻的任务，就该搬家了；反过来，如果 cron 任务全是"看看有没有异常"，那 heartbeat 更合适。
+# 可复用建议
+
+- 命名带节奏：`daily-*`、`weekly-*`、`watch-*`，三个月后还能看懂。
+- 分工一句话：**cron 管对外输出，heartbeat 管对内巡检**。
+- 心跳清单控制在 3 项以内，超了说明该拆成独立 cron 或事件。
+- 每月跑一遍 `cron list`，清掉没人认领的僵尸任务。
+
+# 总结
+
+Cron 是确定性调度，heartbeat 是低成本的环境感知。按“时间点 vs 状态、固定 vs 灵活、频率高低”三问分配，绝大多数场景一秒定案：准点必做的事交给 cron，“顺手看一眼”的事写进 `HEARTBEAT.md`。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-06/a1cb645f756c86c0.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-06/02b7669a488240b3.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-06/835fd1db395cebb3.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-06/b71fa9f353152796.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-06/0516c500c152fc3e.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-06/9f4db6392754ff93.png)
 
