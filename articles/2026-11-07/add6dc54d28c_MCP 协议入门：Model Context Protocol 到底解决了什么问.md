@@ -1,64 +1,74 @@
 ---
 title: MCP 协议入门：Model Context Protocol 到底解决了什么问题
-feedId: 43669
+feedId: 43751
 source: 综合讨论
 publishedAt: 2026-11-07
 ---
 
-## 背景：工具接得越多，痛点越明显
+## 背景
 
-写过 Agent 插件的人大多经历过同一件事：接前两个工具还算愉快，接到第十个就开始怀疑人生。文件系统要一套封装，数据库要一套，浏览器自动化又要一套，每家的鉴权方式、返回格式、错误语义都不一样。更麻烦的是，这些封装换个宿主就要重写——在 OpenClaw 里跑得好的调用层，换到另一个 Agent 框架基本是推倒重来。
+做 Agent 开发绕不开一个现实：模型本身只会生成文本，真正干活靠的是外部能力——查数据库、调内部 API、读文件、发消息。在 MCP 出现之前，这些能力的接入基本是各写各的：OpenAI 用 function calling 的 schema，LangChain 有自己的 Tool 抽象，Claude 又是一套。每写一个工具，就要针对每个运行时适配一遍，N 个模型 × M 个系统，就是 N×M 份胶水代码。
 
-2024 年底 Anthropic 开源了 Model Context Protocol（MCP），思路很直接：在模型应用和外部工具之间放一层标准协议。
+MCP（Model Context Protocol）是 Anthropic 在 2024 年底开源的协议，目标是把"模型怎么连接工具和数据"这件事标准化。可以类比 USB-C：设备形态千差万别，但接口统一了。
 
-## 问题：M×N 的集成爆炸
+## 它到底解决了什么
 
-没有 MCP 的世界里，M 个 Agent 应用对接 N 个工具，理论上需要 M×N 套适配代码，而且各家 function calling 格式还在各自演进，工具作者疲于跟进。MCP 把这个结构变成了 M+N：应用侧实现一次 MCP Client，工具侧实现一次 MCP Server，中间用 JSON-RPC 通信。
+严格说，MCP 没有让模型变聪明，它解决的是工程问题：
 
-协议核心抽象就三类：
+1. **工具复用**。一个 MCP Server 写好后，任何支持 MCP 的客户端（Claude Desktop、各类 Agent 框架、IDE 插件）都能直接挂载，不用为每个运行时重写。
+2. **关注点分离**。鉴权、连接管理、错误处理收敛在 Server 里，Agent 侧只负责决策调用。
+3. **动态发现**。客户端连接后能列出 Server 提供的 tools / resources / prompts，工具清单可以运行时变化，不用改 Agent 代码。
 
-- **Tools**：模型可主动调用的操作（执行类）
-- **Resources**：应用侧读取的数据（文件、记录等）
-- **Prompts**：预置的提示词模板
+## 上手步骤
 
-传输层最常用两种：本地进程走 stdio，远程服务走 HTTP/SSE。理解"三加二"，MCP 的八成就通了。
+最小可用路径四步：
 
-## 做法五步走
+1. **选传输方式**。本地进程用 stdio，远程服务用 Streamable HTTP。先从 stdio 开始最省事。
+2. **写一个最小 Server**。Python SDK 几行就能跑：
 
-以在 OpenClaw 里接一个本地 MCP Server 为例：
+```python
+from mcp.server.fastmcp import FastMCP
 
-1. **选 Server**。优先官方维护的 filesystem、fetch、database 这类，质量比社区长尾版稳定。
-2. **写配置**。在 MCP 配置里声明 `command`、`args`、`env`，stdio 模式下进程由宿主拉起。
-3. **验证发现**。先列出该 Server 暴露的 tools，确认数量和描述符合预期，再接入会话。
-4. **收紧权限**。只放行本次工作流需要的工具，写操作单独开确认。
-5. **跑通闭环**。用一个真实任务（如"读目录、汇总 CSV、写回报告"）端到端验证，不要只看单次调用成功。
+mcp = FastMCP("demo")
+
+@mcp.tool()
+def get_order(order_id: str) -> str:
+    """按订单号查询订单状态，返回状态和最近更新时间。"""
+    return db.query_order(order_id)
+
+mcp.run()
+```
+
+3. **在客户端注册**。配置里声明 command / args / env，客户端启动时拉起该进程。
+4. **用 MCP Inspector 调试**，确认工具列表、入参 schema、返回内容符合预期，再接入真实 Agent。
 
 ## 踩坑点
 
-- **工具描述就是模型的使用说明书**。描述含糊，模型必然乱调参。同一个工具，改了二十字描述后调用准确率明显上升，这种事我遇到过不止一次。
-- **工具越多不等于越强**。几十个 tools 全量注入，上下文膨胀，模型选择反而更容易错。按场景裁剪是必修课。
-- **stdio 模式对路径和环境变量敏感**。相对路径、缺 PATH、工作目录不对，都会表现成"Server 莫名启动失败"。排查第一步：手动跑一遍启动命令。
-- **读写不分离会出事故**。没加确认机制就放开写操作的 Server，出事只是时间问题。
-- **别把 Server 返回内容当可信输入**。网页抓取类工具拿到什么就喂给模型，等于给 prompt injection 开门。
+实际用下来几个高频问题：
+
+- **工具描述太敷衍**。模型选工具完全依赖 name + description，"处理数据"这种描述会导致选错工具、传错参数。描述要按"给新同事看的 API 文档"标准来写。
+- **工具数量失控**。挂 40 个工具后上下文被撑爆，选择准确率明显下降。按场景拆 Server、按需启用。
+- **stdio 环境问题**。Windows 下 npx 直跑经常报错，需要包一层 `cmd /c`；Node/Python 版本不一致会导致静默失败，先看 stderr 日志。
+- **安全别忽视**。MCP Server 跑在你的用户权限下，接入第三方 Server 前要审代码；工具返回内容若被注入指令，模型可能照做，敏感操作务必加人工确认。
 
 ## 可复用建议
 
-- 一个 Server 只做一类事。宁可多起几个小 Server，也别堆一个大杂烩。
-- 给每类工作流维护一份最小工具清单：默认全部禁用，按需启用。
-- 在宿主侧统一记录所有 tool call 的名称、参数和结果摘要，事后审计全靠它。
-- 遗留系统没有现成 MCP Server 的，写个薄封装自己包一层，成本通常低于为它单独写插件。
+- 新集成先做只读工具，跑稳了再放开写操作。
+- 一个 Server 只管一个领域（订单归订单，日志归日志），别做成大杂烩。
+- 返回结构尽量精简，只给模型需要的字段，省 token 也降错误率。
+- 团队内部系统可以收敛到一个内部 MCP Server 统一暴露，比每人各写一遍脚本划算。
 
 ## 总结
 
-MCP 解决的不是"让模型更聪明"，而是**集成方式的标准化**问题。它把工具生态从一次性的胶水代码，变成了可跨宿主复用的资产。对你的 Agent 项目来说，合理的姿势是：先裁剪、后接入，先只读、后写入，把每次接入当成一次小型权限评审。协议本身很朴素，工程纪律才是它能否落地的关键。
+MCP 的价值不在炫技，而在于把重复的胶水工作变成一次性的标准件。如果 Agent 只接一两个工具，直接写 function calling 也够用；一旦要接的系统多起来，或者希望工具能跨客户端复用，MCP 就是当下最值得投入的那层协议。建议从 stdio + 一个只读工具跑通全链路，再逐步扩展，这是最平滑的路径。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-07/c03e050623df1c75.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-07/fd0b8b655a32827f.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-07/b73388fd03b1e5ff.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-07/94537c27442d4048.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-07/0cdf9a412ed01c2b.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-07/a49c0fb4306be11a.png)
 
