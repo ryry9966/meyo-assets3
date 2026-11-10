@@ -1,58 +1,68 @@
 ---
 title: OpenClaw 的 IDENTITY.md：给 AI 一个可进化的身份
-feedId: 43959
+feedId: 43985
 source: 综合讨论
 publishedAt: 2026-11-10
 ---
 
-## 背景：身份不该硬编码在 prompt 里
+## 背景
 
-OpenClaw 的 workspace 里有一组随会话启动注入系统提示的 Markdown：AGENTS.md 管协作规则，SOUL.md 管性格与措辞，USER.md 记录用户信息，而 IDENTITY.md 只回答一个问题——这个 agent 是谁。名字、原型、emoji、头像，就这几行。
+OpenClaw 的 agent 行为不靠硬编码，而是靠 workspace 里一组 Markdown 文件引导：`AGENTS.md` 管操作规程，`SOUL.md` 管性格与边界，`IDENTITY.md` 管"我是谁"。身份卡记录名字、形象、语气约定、emoji 用法，随系统提示常驻注入每个会话。只要它存在，跨会话才有稳定的"同一个人"。
 
-这个设计的价值在于：身份是一等公民的配置文件，而不是散落在模板里的字符串。它可读、可 diff、可回滚，也就可以进化。
+## 问题
 
-## 问题：没有身份文件的三个痛点
+没有 identity 或乱写 identity，常见症状是：
 
-- 多 agent 并跑时，几个实例在同一个群里发言，用户分不清谁是谁；
-- 会话重置或换机迁移后，"我叫什么、什么形象"要靠重新解释，每次口径还不一样；
-- 调好的名字和设定散落在历史对话里，本质上是把身份存进了"记忆"，而记忆是会被压缩的。
+- 每换个会话，自我介绍就变一次，称呼忽冷忽热；
+- 同一个 gateway 挂多个 agent，人格互相串；
+- 想调语气只能改全局提示词，改一次全量生效，且无变更记录；
+- 性格指令散落在配置各处，时间一长没人说得清"它现在是什么人设"。
 
-## 做法：20 行以内，一次到位
+本质问题：身份是一个持续变化的 artifact，却没被当作 artifact 管理。
 
-1. 进入工作区（默认 `~/.openclaw/workspace/`），新建或编辑 IDENTITY.md；
-2. 只写四个字段：`name`、`creature`（原型设定，一句话即可）、`emoji`、`avatar`（指向工作区内的图片文件）。性格措辞留给 SOUL.md，别混写；
-3. `git init` 把 workspace 纳入版本控制，首次提交当作 identity 的 v1；
-4. 改完后 `/new` 开新会话（或重启 gateway）使注入生效。验证方式很朴素：直接问它"你是谁、你长什么样"；
-5. 建立进化回路：每月或遇到实际摩擦时（叫错、混淆、形象不符）改一次，commit message 写清动机，git log 就是你的 changelog。
+## 做法
 
-多 agent 场景下，每个 agent 有独立 workspace，各自维护一份 IDENTITY.md，用不同 emoji 和头像在渠道里做视觉区分即可，不需要在系统提示里写"被叫到 X 时请回答"这类补丁逻辑。
+1. 在 workspace 根目录（默认 `~/.openclaw/workspace/`）建 `IDENTITY.md`，控制在 10 行以内：
+
+```markdown
+# IDENTITY
+- Name: 小爪
+- Creature: 一只安静的机械猫头鹰
+- Vibe: 务实、简短，先结论后步骤
+- Emoji: 仅在完成多步任务后用一个
+- 边界: 不替用户执行不可逆操作
+```
+
+2. 与 `SOUL.md` 划清边界：IDENTITY 管"名片"，SOUL 管"价值观与红线"。重复内容删掉，冲突时以 SOUL 为准。
+3. 打通进化回路：把 workspace 纳入 git。约定一条规则——对话里你重复纠正超过两次的点（语气、称呼、格式），沉淀成一行写回 IDENTITY.md，commit 留痕。
+4. 反向通道：agent 在 heartbeat 或记忆整理时可以"提案"身份修改，落到单独的提案文件，你 diff 后手动合入，禁止直接自改。
+5. 验证：改完后问三个固定问题（自我介绍、复杂任务汇报、拒绝场景），对比输出风格是否如预期变化。
 
 ## 踩坑点
 
-- 会话中途编辑文件不会热加载。排障时先确认是不是没开新会话，别急着怀疑 prompt 模板；
-- 如果你给了 agent 工作区写权限，它可能"自己改自己"。identity 变更必须走 git，发现问题直接 revert；
-- 字段越写越多是常见滑坡。一旦超过 20 行，多半是把 SOUL.md 和 USER.md 的内容塞进来了，拆回去；
-- avatar 用相对路径指向 workspace 内文件，别引用外链，离线或迁移时会挂；
-- 别把用户名、内网路径、密钥写进身份文件——这个文件会进入每一次会话的系统提示。
+- **写长了**：IDENTITY 常驻 system prompt，几千字的身份卡既费 token 又稀释关键指令。我的版本最终稳定在 8 行。
+- **塞事实记忆**：项目上下文、联系方式这类内容应进 `USER.md` / `MEMORY.md`，混进 identity 只会让它无限膨胀。
+- **免审自改**：放开过一次让 agent 直接编辑，一周就漂移到过度拟人，靠 git 回滚才救回来。
+- **与 AGENTS.md 冲突**：emoji 规则在两处写得不一致，模型输出随机偏向其一，收敛成单一来源才稳定。
 
 ## 可复用建议
 
-- 把 identity 当配置代码管：改动走 PR，人工 review 后合并，合并即对下一次新会话生效；
-- 多实例提前定命名规范（比如"项目名-职能"），避免后期在群里撞名；
-- 每次 memory compaction 或定期维护时顺手 review 一遍 IDENTITY.md，成本一分钟；
-- 让 agent 有提案权、没有表决权：它可以建议修改自己的身份，但落盘必须由人提交。
+- 把 identity 当代码管理：小、可 diff、可回滚；
+- 变更来源固定：只收录真实对话里的纠正点，不凭空想象；
+- 多 agent = 多 workspace，各自 identity，互不污染；
+- 每次只改一行，改完跑固定测试问题，保持小步迭代。
 
 ## 总结
 
-IDENTITY.md 便宜到容易被忽视，但它是 agent 长期稳定运行的地基之一：一份可 diff、可回滚、随实际摩擦缓慢进化的身份文件，比任何精巧的 prompt 技巧都更能让 agent 保持"始终是同一个它"。先写 20 行，提交进 git，然后允许它慢慢变。
+IDENTITY.md 的价值不在文件本身，而在于把"人格"变成可版本化、可评审、可回滚的工程对象。一行身份描述的影响远比想象中大。管好这个几 KB 的小文件，agent 才能长期一致地做"同一个助手"。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-10/1812a3e766aca24f.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-10/55ed714ced0d9a9b.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-10/976cb2cbbdbf7a0a.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-10/520899c24318f102.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-10/7ee7b736ac602c72.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-10/a5f808709f3a8da0.png)
 
