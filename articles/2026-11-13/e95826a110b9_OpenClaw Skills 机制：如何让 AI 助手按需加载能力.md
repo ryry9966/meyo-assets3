@@ -1,63 +1,74 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 44304
+feedId: 44343
 source: 综合讨论
 publishedAt: 2026-11-13
 ---
 
 ## 背景
 
-在 OpenClaw 里给 agent 扩能力有三条常见路径：MCP 负责接外部工具，插件负责改运行时行为，而 Skills 解决的是另一个问题——**把"怎么做某类事"的流程知识，按需喂给模型**。
-
-它的核心设计是渐进式披露（progressive disclosure）：agent 启动时只扫描每个 skill 的元数据（name + description），正文并不进上下文；只有当任务与描述匹配时，SKILL.md 的内容才被加载。skill 内部还可以再引用脚本和参考文档，形成"元数据 → 正文 → 资源"的三级按需结构。
+随着接入的工具和 SOP 越来越多，很多人把所有能力描述、操作手册一股脑堆进 system prompt。结果上下文轻松突破几万 token：推理变慢、费用上升，模型在几十个相似工具之间反复选错。OpenClaw 的 Skills 机制就是针对这个矛盾：能力按目录组织，启动时只加载"索引"，运行时按需展开。
 
 ## 问题
 
-没有这层机制时，常见做法是把操作手册、格式约定、领域知识全塞进 system prompt 或身份文件。后果很直接：
+三个具体矛盾：
 
-- 上下文常驻膨胀，每轮对话都为用不到的知识付费；
-- 注意力被稀释，真正相关的指令反而容易被淹没；
-- MCP 工具装多了同理，工具 schema 本身就吃掉几千 token。
-
-实测下来，几十个 skill 的描述加起来只有几百 token，比全量注入低一个数量级。这就是按需加载的意义。
+1. **能力数量 vs 上下文预算**：50 个技能的完整说明可能占 3~5 万 token，不可能常驻。
+2. **描述粒度 vs 触发准确率**：写得含糊，模型想不起来用；写得宽泛，又到处误触发。
+3. **确定性步骤 vs 自然语言**：让模型"读文档再照做"，不如让它直接执行脚本。
 
 ## 做法
 
-以给 agent 加一个"周报生成"能力为例：
+核心是三级渐进加载（progressive disclosure）：
 
-1. **建目录**：workspace 下建 `skills/weekly-report/`，一个 skill 一个文件夹；
-2. **写 SKILL.md**：frontmatter 填 name 和 description。description 是触发的唯一依据，写清"什么时候用"，例如"当用户要求汇总本周工作、生成周报或站会纪要时使用"，别写成抒情文案；
-3. **正文只写流程**：步骤、字段约束、输出格式，控制在几十行以内；
-4. **大块内容外置**：详细模板放 `references/`，确定性逻辑写成 `scripts/` 里的脚本（比如拉 git log、聚合 issue），正文注明"执行时读取"；
-5. **验证**：重启 gateway 或等下一次 heartbeat 重扫，然后丢一个应触发它的任务过去，确认它真的加载了。
+1. **索引常驻**：每个技能是一个目录，`SKILL.md` 的 frontmatter 写 name 和 description。OpenClaw 启动时扫描技能目录，只把 name + description 注入 system prompt，单条控制在两三行。200 个技能的索引也就几千 token。
+2. **正文按需展开**：模型判断任务命中某技能时，才把 `SKILL.md` 正文（操作步骤、约束、输出格式约定）载入上下文。
+3. **资源引用**：正文可引用 `scripts/`、`references/` 下的文件。确定性流程写成脚本直接执行——脚本本身不进上下文，只有输出结果进。
+
+目录结构示例：
+
+```text
+skills/
+  pdf-extract/
+    SKILL.md                 # frontmatter: name, description
+    scripts/extract.py
+    references/layout-spec.md
+```
+
+写作要点：
+
+- description 用 "Use when ..." 句式写触发条件，并写反例（如"不要用于图片 OCR"）。
+- 正文用祈使句写步骤，明确输入、输出字段和失败兜底。
+- 脚本不依赖 CWD，用相对 `SKILL.md` 的路径解析资源。
+- 用 `openclaw skills list` 查看索引体积，按 workspace 灰度启停。
 
 ## 踩坑点
 
-- **description 太泛**，skill 永远不被触发。用任务动词和对象词来写，把它当搜索引擎的广告位。
-- **数量失控**。描述列表本身也占上下文，别给每个小偏好都建 skill，高频场景优先。
-- **Skills 是提示词，不是沙箱**。scripts 以 agent 自身权限执行，密钥不要写进 skill，敏感操作在正文里写明需人工确认。
-- **和身份文件抢话**。行为准则放身份文件，操作步骤放 skill，两处冲突时模型会随机站队。
-- **改完没重扫**。以为没生效，其实是旧索引；先确认加载状态再排查。
-- **触发范围重叠**。两个 skill 都匹配时 agent 会选错，把各自的边界条件写进 description。
+- **description 是检索键，不是简介**。写成"处理 PDF 相关任务"，命中全靠运气。触发场景、输入形态、排除条件都要点明。
+- **正文写成散文**。模型要的是可执行步骤：编号、明确 JSON 字段名，比一段流畅的背景介绍有用得多。
+- **技能互相引用成环**。A 指向 B、B 又指回 A，上下文来回膨胀，保持单向引用。
+- **脚本权限**。技能脚本随 agent 权限运行，务必放进沙箱或受限目录，别让脚本能碰到凭证路径。
+- **只写不测**。准备 10~20 条典型触发语句做回归，统计误触发和漏触发，比肉眼审 description 有效。
 
 ## 可复用建议
 
-- 命名用动宾结构（如 `pdf-extract`、`weekly-report`），一 skill 一件事；
-- 确定性步骤交给脚本，判断性步骤写指令，别用提示词硬模拟计算；
-- 持续迭代 description：遇到没触发或误触发的 case，回来改描述，通常比改正文更有效；
-- skill 就是一个普通文件夹，git 管理即可，团队内复用成本几乎为零。
+- 一个技能只做一件事，命名用动词短语（pdf-extract、log-triage）。
+- 确定性流程下沉到脚本，脚本输出务必结构化；需要判断的部分才写在正文里。
+- 已有 MCP 工具不必搬进技能：技能正文负责"何时调、按什么参数调"，MCP 工具负责执行，二者是编排关系不是替代关系。
+- 技能进 git，review 照代码流程来；description 与正文的改动放同一次提交。
+- 上线后记录触发日志：哪些技能被加载、加载后任务是否成功。两周数据足够决定砍掉哪些。
 
 ## 总结
 
-Skills 的价值不在"能力多"，而在"按需"。把它当成给 agent 维护的一套操作手册库：元数据做索引，正文按需加载，细节再下钻到脚本和参考文档。上下文省下来的每一个 token，都应该留给当前任务本身。
+Skills 本质上是给 agent 能力做的"按需分页"：索引常驻、正文换入、资源引用。把 description 当检索键打磨，把正文当操作手册写，把确定性逻辑下沉到脚本，上下文预算和触发准确率就能同时保住。如果现在的 system prompt 里还压着几段大 SOP，先挑最占篇幅的三段拆成技能试一下，效果最直观。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-13/ed5aea94fd33cc2e.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-13/3cfdefb2646e13ef.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-13/87b569fa1ca2e8d1.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-13/24d4f4be2b9f963c.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-13/0b3fd9f0c32a41d7.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets3@main/images/2026-11-13/0e2809c7d68f712f.png)
 
